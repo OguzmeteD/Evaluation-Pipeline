@@ -871,3 +871,350 @@ response = self.sdk_client.api.score_v_2.get(
 - `ReadTimeout` nedeniyle Dataset Builder sayfasinin dusme riski azaltildi.
 - Varsayilan score page size daha kucuk oldugu icin agir sorgularda timeout olasiligi da dustu.
 - Tumuyle basarisiz sorgularda bile UI warning verip calismaya devam ediyor.
+
+## 2026-03-15 LiteLLM Cost Dataset Builder
+
+Bu iterasyonda mevcut LiteLLM Postgres log/store verisinden request-level cost dataset olusturmak icin yeni bir `LiteLLM Cost Builder` akisi eklendi.
+
+### Ne degisti
+
+- `src/schemas/litellm_cost_builder.py`
+  - LiteLLM cost builder icin typed modeller eklendi:
+    - `LiteLLMFieldMapping`
+    - `LiteLLMStoreConfig`
+    - `LiteLLMCostFilters`
+    - `LiteLLMCostCandidateRow`
+    - `LiteLLMCostPreviewSummary`
+    - `LiteLLMCostDatasetPreview`
+    - `LiteLLMCostDatasetRequest`
+    - `LiteLLMCostDatasetResult`
+- `src/core/litellm_store.py`
+  - Yeni Postgres adapter.
+  - LiteLLM log tablosunu env tabanli configurable column mapping ile okuyor.
+  - Read-only calisiyor; migration yapmiyor.
+  - `require_langfuse_join` filtreleme ve cost/token/latency filtrelerini SQL seviyesinde destekliyor.
+- `src/core/litellm_cost_builder.py`
+  - Yeni servis.
+  - LiteLLM request kayitlarini normalize ediyor.
+  - Preview summary hesapliyor.
+  - Sonucu Langfuse `create_dataset(...)` ve `create_dataset_item(...)` ile dataset olarak yaziyor.
+  - Dataset name collision durumunda create islemini blokluyor.
+- `src/frontend/pages/litellm_cost_builder.py`
+  - Yeni Streamlit sayfasi.
+  - `Store Config`, `Cost Filters`, `Preview`, `Create Langfuse Dataset` bloklarini gosteriyor.
+  - Request-level satir secimi ve `Open in Experiment Studio` handoff aksiyonu var.
+- `src/frontend/streamlit_app.py`
+  - Sidebar navigasyona `LiteLLM Cost Builder` eklendi.
+- `tests/test_litellm_cost_builder.py`
+  - Service, store config ve page helper testleri eklendi.
+
+### Gerekli env degiskenleri
+
+Yeni LiteLLM source mapping env'leri:
+
+- `LITELLM_DATABASE_URL`
+- `LITELLM_LOG_TABLE`
+- `LITELLM_ID_COLUMN`
+- `LITELLM_CREATED_AT_COLUMN`
+- `LITELLM_MODEL_COLUMN`
+- `LITELLM_COST_COLUMN`
+
+Opsiyonel alanlar:
+
+- `LITELLM_PROVIDER_COLUMN`
+- `LITELLM_INPUT_TOKENS_COLUMN`
+- `LITELLM_OUTPUT_TOKENS_COLUMN`
+- `LITELLM_TOTAL_TOKENS_COLUMN`
+- `LITELLM_LATENCY_MS_COLUMN`
+- `LITELLM_STATUS_COLUMN`
+- `LITELLM_INPUT_COLUMN`
+- `LITELLM_OUTPUT_COLUMN`
+- `LITELLM_METADATA_COLUMN`
+- `LITELLM_LANGFUSE_TRACE_ID_COLUMN`
+- `LITELLM_LANGFUSE_OBSERVATION_ID_COLUMN`
+- `LITELLM_DB_TIMEOUT_SECONDS`
+
+### Nasil calisir
+
+1. Kullanici LiteLLM store config durumunu yeni sayfada gorur.
+2. Tarih/model/provider/status/cost/token/latency filtrelerini girer.
+3. Store adapter ilgili LiteLLM request satirlarini Postgres'ten ceker.
+4. Service bu satirlari request-level candidate row'lara normalize eder.
+5. Kullanici secili request satirlarini dataset icin filtreler.
+6. `Create Langfuse Dataset` ile secili request'ler Langfuse dataset item olarak yazilir.
+7. Gerekirse dataset tek tikla `Experiment Studio` sayfasina tasinabilir.
+
+### Kisa kod ornegi
+
+```python
+preview = preview_litellm_cost_candidates(
+    LiteLLMCostFilters(
+        model_names=["gpt-4.1"],
+        providers=["openai"],
+        min_cost=0.01,
+        limit=100,
+    )
+)
+
+result = create_litellm_cost_dataset(
+    LiteLLMCostDatasetRequest(
+        dataset_name="litellm-cost-requests-v1",
+        rows=preview.rows,
+        filters=preview.filters,
+    )
+)
+```
+
+### Durum
+
+- LiteLLM icin yeni bir request-level cost dataset builder eklendi.
+- Veri kaynagi mevcut Postgres/store; yeni LiteLLM proxy kurulumu bu iterasyonda yok.
+- Langfuse join opsiyonel; request kaydi join olmadan da dataset'e girebilir.
+- Full test suite gecti.
+
+### Sonraki adim onerileri
+
+- LiteLLM proxy API endpoint'lerinden cost/log ingestion icin ikinci source adapter eklemek.
+- Preview tablosuna model/provider toplulaştırma ve grouped cost breakdown kartlari eklemek.
+- LiteLLM dataset create sonuclarini Run History veya ayri bir cost history tablosuna yazmak.
+
+## 2026-03-16 Ornek .env Dosyasi
+
+### Ne degisti
+
+- Repo kokune yeni bir `.env.example` dosyasi eklendi.
+- Dosya; Langfuse, Experiment Studio, Prompt Coach, PostgreSQL run history ve LiteLLM Postgres source mapping alanlarini birlikte gosteriyor.
+- Boylece gercek LiteLLM veritabani ile calismaya baslarken gerekli environment degiskenleri tek yerde gorulebilir hale geldi.
+
+### Eklenen veya degisen moduller
+
+- Yeni dosya: `.env.example`
+
+### Nasil calisir
+
+1. Kullanici `.env.example` dosyasini baz alarak kendi `.env` dosyasini doldurur.
+2. Uygulamanin env loader'i once repo kokundeki `.env` dosyasini, sonra gerekirse `src/.env` dosyasini okur.
+3. LiteLLM Cost Builder sayfasi `LITELLM_*` mapping alanlarini kullanarak mevcut Postgres tablo/kolonlarini okur.
+4. Langfuse ve diger uygulama modulleri ayni `.env` uzerinden calisir.
+
+### Kisa kod ornegi
+
+```bash
+cp .env.example .env
+```
+
+```env
+LITELLM_DATABASE_URL=postgresql://user:password@localhost:5432/litellm
+LITELLM_LOG_TABLE=LiteLLM_SpendLogs
+LITELLM_ID_COLUMN=request_id
+LITELLM_CREATED_AT_COLUMN=startTime
+LITELLM_MODEL_COLUMN=model
+LITELLM_COST_COLUMN=spend
+```
+
+### Durum
+
+- LiteLLM entegrasyonu icin gerekli env yuzeyi artik ornek dosya ile dokumante edildi.
+- Kullanici tarafinda yalnizca gercek baglanti bilgileri ve kendi tablo/kolon adlariyla doldurulmasi gerekiyor.
+
+### Sonraki adim onerileri
+
+- Gercek LiteLLM tablo yapisina gore `.env` icindeki opsiyonel kolonlari netlestirmek.
+- Gerekirse ikinci bir `.env.litellm.example` varyanti eklemek.
+
+## 2026-03-16 LiteLLM Code-First Tablo Bootstrap
+
+### Ne degisti
+
+- LiteLLM store katmani code-first tablo mantigina gecirildi.
+- Artik LiteLLM request log tablosu icin canonical bir Postgres semasi kod icinde tanimli.
+- Store, DSN mevcutsa ve `LITELLM_AUTO_CREATE_TABLE=true` ise ilk erisimde `CREATE TABLE IF NOT EXISTS` ile tabloyu bootstrap ediyor.
+- `LiteLLM Cost Builder` sayfasina `Ensure LiteLLM table exists` aksiyonu eklendi.
+- `.env.example` code-first tablo varsayimlarini gosterecek sekilde guncellendi.
+
+### Eklenen veya degisen moduller
+
+- `src/schemas/litellm_cost_builder.py`
+  - Canonical LiteLLM tablo default alanlari eklendi.
+  - `LiteLLMStoreConfig` modeline `auto_create_table`, `schema_mode`, `table_bootstrapped` alanlari eklendi.
+- `src/core/litellm_store.py`
+  - Env verilmezse canonical `litellm_request_logs` tablosuna defaultlayan mapping eklendi.
+  - `ensure_schema()` ile code-first tablo ve index bootstrap mantigi eklendi.
+  - DDL icin guvenli identifier quoting eklendi.
+- `src/core/litellm_cost_builder.py`
+  - `ensure_litellm_store_schema()` helper eklendi.
+- `src/frontend/pages/litellm_cost_builder.py`
+  - Store config bolumune tablo bootstrap butonu ve durum bilgisi eklendi.
+- `.env.example`
+  - Canonical tablo alanlari ve `LITELLM_AUTO_CREATE_TABLE` eklendi.
+- `tests/test_litellm_cost_builder.py`
+  - Code-first config, DDL ve index uretimi testleri eklendi.
+
+### Nasil calisir
+
+Canonical tablo varsayimi:
+
+- tablo adi: `litellm_request_logs`
+- primary key: `request_id`
+- ana kolonlar:
+  - `created_at`
+  - `model_name`
+  - `provider`
+  - `total_cost`
+  - `input_tokens`
+  - `output_tokens`
+  - `total_tokens`
+  - `latency_ms`
+  - `status`
+  - `request_input`
+  - `request_output`
+  - `metadata`
+  - `langfuse_trace_id`
+  - `langfuse_observation_id`
+
+Akis:
+
+1. Uygulama `LITELLM_DATABASE_URL` veya `DATABASE_URL` ile Postgres baglantisini alir.
+2. `PostgresLiteLLMStore` canonical mapping'i kullanir.
+3. `LITELLM_AUTO_CREATE_TABLE=true` ise store ilk sorgudan once tablo ve index'leri kontrol eder.
+4. Tablo yoksa koddan uretilen DDL ile olusturulur.
+5. `LiteLLM Cost Builder` sayfasi ayni tabloyu okuyarak preview ve dataset create akisina devam eder.
+6. Mevcut farkli bir LiteLLM tablon varsa `LITELLM_*_COLUMN` env'leri ile override edebilirsin.
+
+### Kisa kod ornegi
+
+```python
+store = PostgresLiteLLMStore()
+warnings = store.ensure_schema()
+rows, warnings = store.list_requests(LiteLLMCostFilters(limit=100))
+```
+
+```env
+LITELLM_DATABASE_URL=postgresql://user:password@localhost:5432/litellm
+LITELLM_AUTO_CREATE_TABLE=true
+```
+
+### Durum
+
+- LiteLLM store artik env mapping verilmeden de canonical code-first tablo ile calisabilir.
+- Canonical tabloyu olusturma ve index uretimi testlerle dogrulandi.
+- Full test suite gecti.
+
+### Sonraki adim onerileri
+
+- Canonical tabloya insert eden ayri bir LiteLLM ingestion writer eklemek.
+- Bootstrap edilen tabloya migration/version alanlari ekleyip sema evrimini takip etmek.
+
+## 2026-03-16 Langfuse API Uyumluluk Duzeltmeleri
+
+### Ne degisti
+
+- `Judge Explorer` icin observations v2 cagrisindan artik `parseIoAsJson` parametresi gonderilmiyor.
+- `Prompt Analytics` icin Metrics API query zaman damgalari timezone-aware ISO formatina cevrildi.
+- Bu degisikliklerle iki adet 400-level Langfuse request hatasi giderildi.
+
+### Eklenen veya degisen moduller
+
+- `src/core/langfuse_client.py`
+  - `list_observations()` icinden deprecated `parse_io_as_json=True` kaldirildi.
+  - Metrics query icin `_to_langfuse_iso_datetime()` helper eklendi.
+- `tests/test_langfuse_client.py`
+  - observations v2 cagrisi artik `parse_io_as_json` gondermiyor regression testi eklendi.
+  - metrics timestamp serialization icin regression testi eklendi.
+
+### Nasil calisir
+
+1. `Judge Explorer` observations verisini Langfuse v2 endpoint'inden ham `input/output` string alanlariyla alir.
+2. Uygulama gerekiyorsa bu alanlari kendi tarafinda parse eder; endpoint'e parse flag gondermez.
+3. `Prompt Analytics` filtreleri `datetime` ise Metrics API query'sine `Z` veya timezone offset iceren gecerli ISO datetime olarak serialize edilir.
+4. Naive datetime gelirse uygulama bunu UTC kabul eder.
+
+### Kisa kod ornegi
+
+```python
+query["fromTimestamp"] = self._to_langfuse_iso_datetime(from_timestamp)
+query["toTimestamp"] = self._to_langfuse_iso_datetime(to_timestamp)
+```
+
+```python
+response = self.sdk_client.api.observations_v_2.get_many(
+    limit=filters.limit,
+    cursor=filters.cursor,
+    from_start_time=filters.from_date,
+    to_start_time=filters.to_date,
+)
+```
+
+### Durum
+
+- `Judge Explorer` icin observations endpoint uyumluluk hatasi giderildi.
+- `Prompt Analytics` icin invalid ISO datetime hatasi giderildi.
+- Full test suite gecti.
+
+### Sonraki adim onerileri
+
+- Gerekirse Langfuse API v2 uyumluluklari icin diger endpoint parametrelerini de taramak.
+
+## 2026-03-16 LiteLLM Ingestion Writer
+
+### Ne degisti
+
+- Canonical LiteLLM code-first tabloya veri yazmak icin ayri bir ingestion writer eklendi.
+- LiteLLM Cost Builder sayfasina JSON tabanli `Ingestion Writer` bolumu eklendi.
+- Store katmani artik canonical LiteLLM request row'larini `upsert` edebiliyor.
+
+### Eklenen veya degisen moduller
+
+- Yeni schema: `src/schemas/litellm_ingestion.py`
+  - `LiteLLMIngestionRow`
+  - `LiteLLMIngestionRequest`
+  - `LiteLLMIngestionResult`
+- Yeni servis: `src/core/litellm_ingestion.py`
+  - `LiteLLMIngestionWriterService`
+  - `ingest_litellm_rows(...)`
+- `src/core/litellm_store.py`
+  - `upsert_requests(...)` eklendi.
+  - `request_id` uzerinden `ON CONFLICT DO UPDATE` ile canonical tabloya upsert yapiyor.
+- `src/frontend/pages/litellm_cost_builder.py`
+  - Ingestion Writer UI eklendi.
+  - JSON object veya JSON array kabul ediyor.
+- `tests/test_litellm_cost_builder.py`
+  - ingestion writer service ve parsing testleri eklendi.
+
+### Nasil calisir
+
+1. Kullanici veya upstream servis canonical LiteLLM request row'larini JSON olarak verir.
+2. UI veya servis bu payload'i `LiteLLMIngestionRow` listesine dogrular.
+3. Store gerekirse once code-first tabloyu bootstrap eder.
+4. Satirlar `request_id` primary key'i ile upsert edilir.
+5. Ayni request tekrar gelirse yeni cost/token/metadata degerleri ile guncellenir.
+6. Daha sonra `LiteLLM Cost Builder` ayni tabloyu okuyup preview ve dataset create akisina devam eder.
+
+### Kisa kod ornegi
+
+```python
+result = ingest_litellm_rows(
+    LiteLLMIngestionRequest(
+        rows=[
+            {
+                "request_id": "req-123",
+                "model_name": "gpt-4.1-mini",
+                "total_cost": 0.018,
+                "input_tokens": 120,
+                "output_tokens": 45,
+                "request_input": {"messages": [{"role": "user", "content": "Hello"}]},
+            }
+        ]
+    )
+)
+```
+
+### Durum
+
+- LiteLLM tarafinda artik hem code-first tablo bootstrap'i hem de tabloya veri yazan ingestion writer mevcut.
+- Full test suite gecti.
+
+### Sonraki adim onerileri
+
+- LiteLLM proxy veya uygulama callback katmanindan dogrudan bu writer'a veri akitan adapter eklemek.
+- Ingestion writer icin batch dosya import ve retry kuyruğu eklemek.

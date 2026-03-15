@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -90,7 +90,6 @@ class LangfuseCollectorClient:
         response = self.sdk_client.api.observations_v_2.get_many(
             limit=filters.limit,
             cursor=filters.cursor,
-            parse_io_as_json=True,
             from_start_time=filters.from_date,
             to_start_time=filters.to_date,
             trace_id=filters.trace_ids[0] if len(filters.trace_ids) == 1 else None,
@@ -480,14 +479,20 @@ class LangfuseCollectorClient:
             "config": {"row_limit": max(1, min(row_limit, 1000))},
         }
         if from_timestamp is not None:
-            query["fromTimestamp"] = from_timestamp.isoformat()
+            query["fromTimestamp"] = self._to_langfuse_iso_datetime(from_timestamp)
         if to_timestamp is not None:
-            query["toTimestamp"] = to_timestamp.isoformat()
+            query["toTimestamp"] = self._to_langfuse_iso_datetime(to_timestamp)
         if order_by:
             query["orderBy"] = order_by
         if time_dimension:
             query["timeDimension"] = {"granularity": time_dimension}
         return self.query_metrics(json.dumps(query))
+
+    @staticmethod
+    def _to_langfuse_iso_datetime(value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.isoformat().replace("+00:00", "Z")
 
     @staticmethod
     def _build_prompt_metrics_filters(filters: PromptMetricsFilters) -> list[dict[str, Any]]:

@@ -1,0 +1,1 @@
+streamlit run /Users/oguz/Desktop/evalpipeline/src/frontend/streamlit_app.py

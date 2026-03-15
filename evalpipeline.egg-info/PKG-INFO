@@ -1,0 +1,84 @@
+Metadata-Version: 2.4
+Name: evalpipeline
+Version: 0.1.0
+Summary: Langfuse-based LLM judge dataset collector and demo UI.
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic<3,>=2.12
+Requires-Dist: langfuse<4,>=3
+Requires-Dist: streamlit<2,>=1.32
+
+# Degisiklik Ozeti
+
+Bu repoya Langfuse tabanli LLM-as-a-Judge veri toplama, normalize etme ve ornek UI ile inceleme akisi eklendi. Sistem artik observation/generation ve trace seviyesinde skor kayitlarini tek bir veri sozlesmesinde birlestirebiliyor.
+
+## Eklenen veya Degistirilen Moduller
+
+- `pyproject.toml`: Paket ve bagimlilik tanimlari eklendi.
+- `src/schemas/evaluation_dataset.py`: Pydantic veri modelleri eklendi.
+- `src/core/langfuse_client.py`: Langfuse SDK erisim ve filtreleme adapter'i eklendi.
+- `src/core/judger.py`: Judge dataset toplama ve normalize etme servisi eklendi.
+- `src/core/prompt_optimizer_agent.py`: Normalize dataset uzerinden prompt iyilestirme yardimci raporu eklendi.
+- `src/frontend/streamlit_app.py`: Streamlit tabanli ornek inceleme arayuzu eklendi.
+- `tests/test_judger.py`: `unittest` tabanli fixture testleri eklendi.
+
+## Sistem Nasil Calisir
+
+1. `LangfuseCollectorClient`, Langfuse SDK uzerinden trace, observation ve score kayitlarini ceker.
+2. `LangfuseJudgeService`, bu ham verileri normalize eder.
+3. Prompt cikarma sirasi:
+   - Langfuse prompt alani
+   - observation input/messages
+   - trace input/messages
+4. Generation cikarma sirasi:
+   - observation output
+   - trace output
+5. Sonuc `EvaluationDataset` olarak dondurulur:
+   - `traces`: trace ozeti
+   - `rows`: generation/judge satirlari
+   - `meta`: filtreler, sayaclar, coverage ve warning alanlari
+6. Streamlit uygulamasi yalnizca bu normalize dataset'i kullanir.
+
+## Kisa Kod Ornekleri
+
+```python
+from src.core.judger import get_evaluation_dataset
+from src.schemas.evaluation_dataset import JudgeDatasetFilters
+
+dataset = get_evaluation_dataset(
+    JudgeDatasetFilters(
+        experiment_id="exp-1",
+        min_score=0.6,
+        limit=100,
+    )
+)
+print(dataset.meta.counts)
+```
+
+```python
+from src.core.prompt_optimizer_agent import PromptOptimizerAgent
+
+report = PromptOptimizerAgent().build_report(dataset)
+print(report.summary)
+```
+
+```bash
+streamlit run src/frontend/streamlit_app.py
+```
+
+## Mevcut Durum
+
+- Temel backend veri modeli hazir.
+- Langfuse SDK adapter'i hazir.
+- Prompt ve generation fallback mantigi eklendi.
+- Trace ve observation skor toplama destekleniyor.
+- Demo UI kodu hazir, ancak lokal ortamda `streamlit` su anda kurulu degil.
+- Testler `unittest` ile yazildi.
+- `python3 -m unittest discover -s tests -v` komutu basarili calisti.
+
+## Sonraki Onerilen Adimlar
+
+1. Gercek Langfuse projesine baglanip adapter alanlarini gercek payload ile dogrulayin.
+2. `streamlit` bagimliligini kurup UI akisini canli veri ile calistirin.
+3. Metrics API icin ozel sorgular tanimlayip `meta.metrics` alanini zenginlestirin.
+4. Filtrelerin buyuk veri setlerinde sayfalama davranisini genisletin.

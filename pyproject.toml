@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evalpipeline"
+version = "0.1.0"
+description = "Langfuse-based LLM judge dataset collector and demo UI."
+readme = "summary.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.12,<3",
+  "pydantic-ai>=1.39,<2",
+  "httpx>=0.27,<1",
+  "langfuse>=3,<4",
+  "openai>=2,<3",
+  "psycopg[binary]>=3.2,<4",
+  "streamlit>=1.32,<2",
+]
+
+[tool.setuptools]
+packages = ["src", "src.core", "src.schemas", "src.frontend", "src.frontend.pages"]

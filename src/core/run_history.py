@@ -46,14 +46,16 @@ class PostgresRunHistoryStore:
                         task_prompt_source, task_prompt_name, task_prompt_label, task_prompt_version, task_prompt_type, task_prompt_fingerprint,
                         judge_prompt_source, judge_prompt_name, judge_prompt_label, judge_prompt_version, judge_prompt_type, judge_prompt_fingerprint,
                         published_from_custom, published_at,
-                        task_model, judge_model, metric_names, aggregate_metrics,
+                        task_model, judge_model, endpoint_url, endpoint_method, endpoint_response_type, endpoint_judging_enabled,
+                        openreward_environment_name, openreward_variant, openreward_tool_name, openreward_rollout_logging_enabled, metric_names, aggregate_metrics,
                         processed_items, failed_items, dataset_run_id, dataset_run_url, warnings, errors
                     ) VALUES (
                         %(id)s, %(created_at)s, %(mode)s, %(dataset_name)s, %(run_name)s, %(description)s, %(status)s,
                         %(task_prompt_source)s, %(task_prompt_name)s, %(task_prompt_label)s, %(task_prompt_version)s, %(task_prompt_type)s, %(task_prompt_fingerprint)s,
                         %(judge_prompt_source)s, %(judge_prompt_name)s, %(judge_prompt_label)s, %(judge_prompt_version)s, %(judge_prompt_type)s, %(judge_prompt_fingerprint)s,
                         %(published_from_custom)s, %(published_at)s,
-                        %(task_model)s, %(judge_model)s, %(metric_names)s, %(aggregate_metrics)s,
+                        %(task_model)s, %(judge_model)s, %(endpoint_url)s, %(endpoint_method)s, %(endpoint_response_type)s, %(endpoint_judging_enabled)s,
+                        %(openreward_environment_name)s, %(openreward_variant)s, %(openreward_tool_name)s, %(openreward_rollout_logging_enabled)s, %(metric_names)s, %(aggregate_metrics)s,
                         %(processed_items)s, %(failed_items)s, %(dataset_run_id)s, %(dataset_run_url)s, %(warnings)s, %(errors)s
                     )
                     """,
@@ -81,6 +83,14 @@ class PostgresRunHistoryStore:
                         "published_at": record.published_at,
                         "task_model": record.task_model,
                         "judge_model": record.judge_model,
+                        "endpoint_url": record.endpoint_url,
+                        "endpoint_method": record.endpoint_method,
+                        "endpoint_response_type": record.endpoint_response_type,
+                        "endpoint_judging_enabled": record.endpoint_judging_enabled,
+                        "openreward_environment_name": record.openreward_environment_name,
+                        "openreward_variant": record.openreward_variant,
+                        "openreward_tool_name": record.openreward_tool_name,
+                        "openreward_rollout_logging_enabled": record.openreward_rollout_logging_enabled,
                         "metric_names": Jsonb(record.metric_names),
                         "aggregate_metrics": Jsonb([metric.model_dump() for metric in record.aggregate_metrics]),
                         "processed_items": record.processed_items,
@@ -182,6 +192,14 @@ class PostgresRunHistoryStore:
                         published_at TIMESTAMPTZ NULL,
                         task_model TEXT NULL,
                         judge_model TEXT NULL,
+                        endpoint_url TEXT NULL,
+                        endpoint_method TEXT NULL,
+                        endpoint_response_type TEXT NULL,
+                        endpoint_judging_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                        openreward_environment_name TEXT NULL,
+                        openreward_variant TEXT NULL,
+                        openreward_tool_name TEXT NULL,
+                        openreward_rollout_logging_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                         metric_names JSONB NOT NULL DEFAULT '[]'::jsonb,
                         aggregate_metrics JSONB NOT NULL DEFAULT '[]'::jsonb,
                         processed_items INTEGER NOT NULL DEFAULT 0,
@@ -210,6 +228,30 @@ class PostgresRunHistoryStore:
                 )
                 cur.execute(
                     "ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS endpoint_url TEXT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS endpoint_method TEXT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS endpoint_response_type TEXT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS endpoint_judging_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+                cur.execute(
+                    "ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS openreward_environment_name TEXT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS openreward_variant TEXT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS openreward_tool_name TEXT NULL"
+                )
+                cur.execute(
+                    "ALTER TABLE experiment_runs ADD COLUMN IF NOT EXISTS openreward_rollout_logging_enabled BOOLEAN NOT NULL DEFAULT FALSE"
                 )
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_experiment_runs_created_at ON experiment_runs (created_at DESC)"

@@ -13,10 +13,14 @@ from src.core.experiment_runner import (
     list_prompts,
     publish_prompt,
     resolve_prompt,
+    run_endpoint_evaluation,
+    run_openreward_evaluation,
     run_llm_judge_on_existing_results,
     run_dataset_reevaluation,
     run_prompt_experiment,
 )
+from src.schemas.endpoint_runner import EndpointConfig, EndpointPayloadMapping, EndpointResponseMapping
+from src.schemas.openreward_runner import OpenRewardConfig
 from src.schemas.experiment_runner import (
     EvaluationScope,
     EvaluatorMetricSpec,
@@ -76,9 +80,30 @@ def render() -> None:
     if dataset is not None:
         _render_dataset_loader(dataset)
 
-    task_prompt = _render_prompt_block(title="Task Prompt Source", prefix="task", target=PromptTarget.TASK)
+    mode = st.radio(
+        "Execution mode",
+        options=[
+            ExperimentMode.PROMPT_RUNNER.value,
+            ExperimentMode.REEVALUATE_EXISTING.value,
+            ExperimentMode.ENDPOINT_RUN.value,
+            ExperimentMode.OPENREWARD_RUN.value,
+        ],
+        format_func=lambda value: {
+            ExperimentMode.PROMPT_RUNNER.value: "Prompt Runner",
+            ExperimentMode.REEVALUATE_EXISTING.value: "Re-evaluate Existing",
+            ExperimentMode.ENDPOINT_RUN.value: "Endpoint Run",
+            ExperimentMode.OPENREWARD_RUN.value: "OpenReward Run",
+        }[value],
+        horizontal=True,
+        key="studio_mode",
+    )
+
+    task_prompt = _empty_prompt_state("task")
+    if mode == ExperimentMode.PROMPT_RUNNER.value:
+        task_prompt = _render_prompt_block(title="Task Prompt Source", prefix="task", target=PromptTarget.TASK)
     judge_prompt = _render_prompt_block(title="Judge Prompt Source", prefix="judge", target=PromptTarget.JUDGE)
-    _render_prompt_publish_section(prefix="task", title="Publish task prompt", target=PromptPublishTarget.TASK, prompt_state=task_prompt)
+    if mode == ExperimentMode.PROMPT_RUNNER.value:
+        _render_prompt_publish_section(prefix="task", title="Publish task prompt", target=PromptPublishTarget.TASK, prompt_state=task_prompt)
     _render_prompt_publish_section(prefix="judge", title="Publish judge prompt", target=PromptPublishTarget.JUDGE, prompt_state=judge_prompt)
     _render_run_with_published_prompt()
 
@@ -102,13 +127,6 @@ def render() -> None:
     metrics = build_metric_specs_from_form(preset_metrics, custom_name, custom_rubric)
     _render_metric_preview(metrics)
 
-    mode = st.radio(
-        "Execution mode",
-        options=[ExperimentMode.PROMPT_RUNNER.value, ExperimentMode.REEVALUATE_EXISTING.value],
-        format_func=lambda value: "Prompt Runner" if value == ExperimentMode.PROMPT_RUNNER.value else "Re-evaluate Existing",
-        horizontal=True,
-        key="studio_mode",
-    )
     judge_model = st.text_input(
         "Judge model",
         value=st.session_state.get("studio_judge_model", ""),
@@ -131,12 +149,34 @@ def render() -> None:
 
     scope = EvaluationScope.OBSERVATIONS
     task_model = None
+    endpoint_config = None
+    endpoint_payload_mapping = None
+    endpoint_response_mapping = None
+    enable_endpoint_judging = False
+    openreward_config = None
+    enable_openreward_judging = False
     if mode == ExperimentMode.PROMPT_RUNNER.value:
         task_model = st.text_input(
             "Task model",
             value=st.session_state.get("studio_task_model", ""),
             key="studio_task_model",
             placeholder="ENV varsayilani veya provider:model formati",
+        )
+    elif mode == ExperimentMode.ENDPOINT_RUN.value:
+        endpoint_config = _build_endpoint_config()
+        endpoint_payload_mapping = _build_endpoint_payload_mapping()
+        endpoint_response_mapping = _build_endpoint_response_mapping()
+        enable_endpoint_judging = st.toggle(
+            "Enable endpoint judging",
+            value=False,
+            key="studio_enable_endpoint_judging",
+        )
+    elif mode == ExperimentMode.OPENREWARD_RUN.value:
+        openreward_config = _build_openreward_config()
+        enable_openreward_judging = st.toggle(
+            "Enable OpenReward judging",
+            value=False,
+            key="studio_enable_openreward_judging",
         )
     else:
         allowed_scopes = available_scopes(dataset.items if dataset else [])
@@ -164,6 +204,10 @@ def render() -> None:
         judge_prompt=judge_prompt,
         task_model=task_model,
         judge_model=judge_model,
+        endpoint_config=endpoint_config,
+        enable_endpoint_judging=enable_endpoint_judging,
+        openreward_config=openreward_config,
+        enable_openreward_judging=enable_openreward_judging,
     )
     for error in validation_errors:
         st.warning(error)
@@ -200,6 +244,12 @@ def render() -> None:
                 judge_prompt_type=judge_prompt["prompt_type"],
                 use_published_task_prompt=bool(st.session_state.get("studio_task_use_published_prompt")),
                 use_published_judge_prompt=bool(st.session_state.get("studio_judge_use_published_prompt")),
+                endpoint_config=endpoint_config,
+                endpoint_payload_mapping=endpoint_payload_mapping,
+                endpoint_response_mapping=endpoint_response_mapping,
+                enable_endpoint_judging=enable_endpoint_judging,
+                openreward_config=openreward_config,
+                enable_openreward_judging=enable_openreward_judging,
             )
         )
 
@@ -265,22 +315,295 @@ def validate_run_form(
     judge_prompt: dict[str, Any],
     task_model: str | None,
     judge_model: str | None,
+    endpoint_config: EndpointConfig | None,
+    enable_endpoint_judging: bool,
+    openreward_config: OpenRewardConfig | None,
+    enable_openreward_judging: bool,
 ) -> list[str]:
     errors: list[str] = []
     if dataset is None:
         errors.append("Once dataset fetch edin.")
-    if not metrics:
+    if not metrics and not (
+        (mode == ExperimentMode.ENDPOINT_RUN and not enable_endpoint_judging)
+        or (mode == ExperimentMode.OPENREWARD_RUN and not enable_openreward_judging)
+    ):
         errors.append("En az bir metric secin veya custom metric ekleyin.")
-    if not _prompt_is_ready(prefix="judge", prompt_state=judge_prompt):
-        errors.append("Judge prompt kaynagini resolve edin veya custom prompt girin.")
+    if mode not in {ExperimentMode.ENDPOINT_RUN, ExperimentMode.OPENREWARD_RUN} or enable_endpoint_judging or enable_openreward_judging:
+        if not _prompt_is_ready(prefix="judge", prompt_state=judge_prompt):
+            errors.append("Judge prompt kaynagini resolve edin veya custom prompt girin.")
     if mode == ExperimentMode.PROMPT_RUNNER:
         if not _prompt_is_ready(prefix="task", prompt_state=task_prompt):
             errors.append("Task prompt kaynagini resolve edin veya custom prompt girin.")
         if not task_model:
             errors.append("Prompt Runner icin task model gerekli.")
-    if not judge_model:
+    if mode == ExperimentMode.ENDPOINT_RUN:
+        if endpoint_config is None or not endpoint_config.url.strip():
+            errors.append("Endpoint Run icin endpoint URL gerekli.")
+        if st is not None:
+            if st.session_state.get("studio_endpoint_headers_error"):
+                errors.append("Endpoint headers JSON gecersiz.")
+            if st.session_state.get("studio_endpoint_request_template_error"):
+                errors.append("Endpoint request template JSON gecersiz.")
+        if enable_endpoint_judging and not judge_model:
+            errors.append("Endpoint judging aktifse judge model gerekli.")
+    if mode == ExperimentMode.OPENREWARD_RUN:
+        if openreward_config is None or not openreward_config.environment_name.strip():
+            errors.append("OpenReward Run icin environment name gerekli.")
+        if openreward_config is None or not openreward_config.tool_name.strip():
+            errors.append("OpenReward Run icin tool name gerekli.")
+        if st is not None:
+            if st.session_state.get("studio_openreward_task_spec_template_error"):
+                errors.append("OpenReward task spec template JSON gecersiz.")
+            if st.session_state.get("studio_openreward_tool_input_template_error"):
+                errors.append("OpenReward tool input template JSON gecersiz.")
+        if enable_openreward_judging and not judge_model:
+            errors.append("OpenReward judging aktifse judge model gerekli.")
+    if mode not in {ExperimentMode.ENDPOINT_RUN, ExperimentMode.OPENREWARD_RUN} and not judge_model:
         errors.append("Judge model gerekli.")
     return errors
+
+
+def _empty_prompt_state(prefix: str) -> dict[str, Any]:
+    return {
+        "prefix": prefix,
+        "source": PromptSource.CUSTOM_PROMPT,
+        "prompt_name": None,
+        "prompt_label": None,
+        "prompt_version": None,
+        "prompt_type": PromptType.TEXT,
+        "custom_prompt": "",
+        "custom_messages": [],
+        "resolution": None,
+        "is_ready": False,
+    }
+
+
+def _build_endpoint_config() -> EndpointConfig:
+    st.subheader("Endpoint Config")
+    url = st.text_input(
+        "Endpoint URL",
+        key="studio_endpoint_url",
+        placeholder="https://api.example.com/agent/run",
+    )
+    method = st.selectbox(
+        "HTTP Method",
+        options=["POST", "GET"],
+        key="studio_endpoint_method",
+    )
+    response_type = st.selectbox(
+        "Response type",
+        options=["json", "text"],
+        key="studio_endpoint_response_type",
+    )
+    timeout_col, retry_col = st.columns(2)
+    with timeout_col:
+        timeout_seconds = st.number_input(
+            "Timeout seconds",
+            min_value=1,
+            max_value=300,
+            value=30,
+            key="studio_endpoint_timeout",
+        )
+    with retry_col:
+        retry_count = st.number_input(
+            "Retry count",
+            min_value=0,
+            max_value=5,
+            value=1,
+            key="studio_endpoint_retry_count",
+        )
+    st.markdown("#### Auth")
+    auth_type = st.selectbox(
+        "Auth type",
+        options=["none", "bearer", "api_key_header"],
+        key="studio_endpoint_auth_type",
+    )
+    auth_token_env = st.text_input(
+        "Auth token env",
+        key="studio_endpoint_auth_env",
+        placeholder="ENDPOINT_API_TOKEN",
+        disabled=auth_type == "none",
+    ).strip()
+    headers_text = st.text_area(
+        "Headers JSON",
+        key="studio_endpoint_headers",
+        height=100,
+        placeholder='{"Content-Type":"application/json"}',
+    )
+    headers, headers_error = _parse_json_object(headers_text)
+    if headers_error:
+        st.warning(headers_error)
+    if headers is None:
+        headers = {}
+    if not isinstance(headers, dict):
+        st.warning("Headers JSON object olmali.")
+        headers = {}
+    st.session_state["studio_endpoint_headers_error"] = headers_error
+    st.session_state["studio_endpoint_response_type_value"] = response_type
+    return EndpointConfig(
+        url=url.strip(),
+        method=method,
+        headers={str(key): str(value) for key, value in headers.items()},
+        auth_type=auth_type,
+        auth_token_env=auth_token_env or None,
+        timeout_seconds=int(timeout_seconds),
+        retry_count=int(retry_count),
+    )
+
+
+def _build_endpoint_payload_mapping() -> EndpointPayloadMapping:
+    st.markdown("#### Request Mapping")
+    input_field_name = st.text_input(
+        "Input field name",
+        key="studio_endpoint_input_field_name",
+        value="input",
+    ).strip() or "input"
+    expected_output_field_name = st.text_input(
+        "Expected output field name (optional)",
+        key="studio_endpoint_expected_output_field_name",
+    ).strip() or None
+    metadata_field_name = st.text_input(
+        "Metadata field name (optional)",
+        key="studio_endpoint_metadata_field_name",
+    ).strip() or None
+    request_template_text = st.text_area(
+        "Request template JSON (optional)",
+        key="studio_endpoint_request_template",
+        height=140,
+        placeholder='{"messages":[{"role":"user","content":"{{input}}"}],"reference":"{{expected_output}}"}',
+    )
+    request_template, template_error = _parse_json_object(request_template_text)
+    if template_error:
+        st.warning(template_error)
+    st.session_state["studio_endpoint_request_template_error"] = template_error
+    return EndpointPayloadMapping(
+        input_field_name=input_field_name,
+        expected_output_field_name=expected_output_field_name,
+        metadata_field_name=metadata_field_name,
+        request_template=request_template,
+    )
+
+
+def _build_endpoint_response_mapping() -> EndpointResponseMapping:
+    st.markdown("#### Response Mapping")
+    response_type = st.session_state.get("studio_endpoint_response_type_value", "json")
+    output_json_path = st.text_input(
+        "Output JSON path (optional)",
+        key="studio_endpoint_output_json_path",
+        disabled=response_type == "text",
+        placeholder="result.output_text",
+    ).strip() or None
+    trace_id_json_path = st.text_input(
+        "Trace ID JSON path (optional)",
+        key="studio_endpoint_trace_id_json_path",
+        disabled=response_type == "text",
+        placeholder="trace_id",
+    ).strip() or None
+    observation_id_json_path = st.text_input(
+        "Observation ID JSON path (optional)",
+        key="studio_endpoint_observation_id_json_path",
+        disabled=response_type == "text",
+        placeholder="observation_id",
+    ).strip() or None
+    metadata_json_path = st.text_input(
+        "Metadata JSON path (optional)",
+        key="studio_endpoint_metadata_json_path",
+        disabled=response_type == "text",
+        placeholder="metadata",
+    ).strip() or None
+    tool_trace_json_path = st.text_input(
+        "Tool trace JSON path (optional)",
+        key="studio_endpoint_tool_trace_json_path",
+        disabled=response_type == "text",
+        placeholder="tool_trace",
+    ).strip() or None
+    return EndpointResponseMapping(
+        response_type=response_type,
+        output_json_path=output_json_path,
+        trace_id_json_path=trace_id_json_path,
+        observation_id_json_path=observation_id_json_path,
+        metadata_json_path=metadata_json_path,
+        tool_trace_json_path=tool_trace_json_path,
+    )
+
+
+def _build_openreward_config() -> OpenRewardConfig:
+    st.subheader("OpenReward Config")
+    environment_name = st.text_input(
+        "Environment name",
+        key="studio_openreward_environment_name",
+        placeholder="owner/environment-name",
+    )
+    variant = st.text_input(
+        "Variant (optional)",
+        key="studio_openreward_variant",
+        placeholder="production",
+    ).strip() or None
+    tool_name = st.text_input(
+        "Tool name",
+        key="studio_openreward_tool_name",
+        placeholder="submit",
+    )
+    tool_input_field_name = st.text_input(
+        "Default tool input field name",
+        key="studio_openreward_tool_input_field_name",
+        value="input",
+        help="Template verilmezse expected_output veya input bu field altinda gonderilir.",
+    ).strip() or "input"
+    task_spec_template_text = st.text_area(
+        "Task spec template JSON (optional)",
+        key="studio_openreward_task_spec_template",
+        height=120,
+        placeholder='{"question":"{{input}}","reference":"{{expected_output}}"}',
+    )
+    task_spec_template, task_spec_template_error = _parse_json_object(task_spec_template_text)
+    if task_spec_template_error:
+        st.warning(task_spec_template_error)
+    st.session_state["studio_openreward_task_spec_template_error"] = task_spec_template_error
+    tool_input_template_text = st.text_area(
+        "Tool input template JSON (optional)",
+        key="studio_openreward_tool_input_template",
+        height=120,
+        placeholder='{"answer":"{{expected_output}}"}',
+    )
+    tool_input_template, tool_input_template_error = _parse_json_object(tool_input_template_text)
+    if tool_input_template_error:
+        st.warning(tool_input_template_error)
+    st.session_state["studio_openreward_tool_input_template_error"] = tool_input_template_error
+    log_rollout = st.toggle(
+        "Log rollout to OpenReward",
+        value=False,
+        key="studio_openreward_log_rollout",
+    )
+    rollout_run_name = st.text_input(
+        "OpenReward rollout run name (optional)",
+        key="studio_openreward_rollout_run_name",
+        placeholder="agent-eval-run",
+        disabled=not log_rollout,
+    ).strip() or None
+    print_rollout_messages = st.toggle(
+        "Print rollout messages",
+        value=False,
+        key="studio_openreward_print_rollout_messages",
+        disabled=not log_rollout,
+    )
+    base_url = st.text_input(
+        "OpenReward base URL (optional)",
+        key="studio_openreward_base_url",
+        placeholder="https://openreward.ai",
+    ).strip() or None
+    return OpenRewardConfig(
+        environment_name=environment_name.strip(),
+        variant=variant,
+        tool_name=tool_name.strip(),
+        task_spec_template=task_spec_template,
+        tool_input_template=tool_input_template,
+        tool_input_field_name=tool_input_field_name,
+        log_rollout=log_rollout,
+        rollout_run_name=rollout_run_name,
+        print_rollout_messages=print_rollout_messages,
+        base_url=base_url,
+    )
 
 
 def _prompt_is_ready(*, prefix: str, prompt_state: dict[str, Any]) -> bool:
@@ -634,11 +957,14 @@ def _load_dataset(dataset_name: str) -> None:
 
 
 def _execute(request: ExperimentExecutionRequest) -> None:
-    result = (
-        run_prompt_experiment(request)
-        if request.mode == ExperimentMode.PROMPT_RUNNER
-        else run_llm_judge_on_existing_results(request)
-    )
+    if request.mode == ExperimentMode.PROMPT_RUNNER:
+        result = run_prompt_experiment(request)
+    elif request.mode == ExperimentMode.ENDPOINT_RUN:
+        result = run_endpoint_evaluation(request)
+    elif request.mode == ExperimentMode.OPENREWARD_RUN:
+        result = run_openreward_evaluation(request)
+    else:
+        result = run_llm_judge_on_existing_results(request)
     st.session_state["studio_result"] = result
 
 
@@ -732,7 +1058,10 @@ def _render_result(result: ExperimentExecutionResult) -> None:
                 "entity_id": row.entity_id,
                 "entity_type": row.entity_type,
                 "trace_id": row.trace_id,
+                "status_code": row.status_code,
+                "latency_ms": row.latency_ms,
                 "evaluation_count": len(row.evaluations),
+                "error": _preview(row.error),
                 "output": _preview(row.output),
             }
             for row in result.item_results
@@ -752,11 +1081,23 @@ def _render_result(result: ExperimentExecutionResult) -> None:
         with left:
             st.markdown("#### Input")
             _render_value_block("Input payload", selected.input)
+            if selected.request_payload is not None:
+                st.markdown("#### Request payload")
+                _render_value_block("Request payload", selected.request_payload)
             st.markdown("#### Expected output")
             _render_value_block("Expected output payload", selected.expected_output)
             st.markdown("#### Output")
             _render_value_block("Output payload", selected.output)
         with right:
+            if selected.raw_response is not None:
+                st.markdown("#### Raw response")
+                _render_value_block("Raw response payload", selected.raw_response)
+            if selected.response_metadata is not None:
+                st.markdown("#### Response metadata")
+                _render_value_block("Response metadata payload", selected.response_metadata)
+            if selected.error:
+                st.markdown("#### Endpoint error")
+                st.error(selected.error)
             st.markdown("#### Evaluations")
             if selected.evaluations:
                 st.dataframe(

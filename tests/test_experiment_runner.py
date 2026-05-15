@@ -17,6 +17,8 @@ from src.frontend.pages.experiment_studio import (
     count_missing_scope_ids,
     validate_run_form,
 )
+from src.schemas.endpoint_runner import EndpointConfig, EndpointExecutionResult as EndpointExecutionOutput, EndpointItemResult, EndpointResponseMapping
+from src.schemas.openreward_runner import OpenRewardConfig, OpenRewardExecutionResult as OpenRewardExecutionOutput, OpenRewardItemResult
 from src.schemas.experiment_runner import (
     DatasetFetchResult,
     EvaluationScope,
@@ -179,6 +181,91 @@ class FakeLLMGateway:
             output=output,
             expected_output=expected_output,
             metadata=metadata,
+        )
+
+
+class FakeEndpointRunner:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def run_endpoint_execution(self, *, items: list[Any], request: Any) -> EndpointExecutionOutput:
+        self.calls.append({"items": items, "request": request})
+        return EndpointExecutionOutput(
+            processed_items=len(items),
+            failed_items=1,
+            item_results=[
+                EndpointItemResult(
+                    dataset_item_id=items[0].id,
+                    request_payload={"input": items[0].input},
+                    raw_response={"result": {"text": "ok"}},
+                    output="ok",
+                    trace_id="trace-endpoint",
+                    observation_id="obs-endpoint",
+                    status_code=200,
+                    latency_ms=123.0,
+                    error=None,
+                    response_metadata={"source": "endpoint"},
+                ),
+                EndpointItemResult(
+                    dataset_item_id=items[1].id,
+                    request_payload={"input": items[1].input},
+                    raw_response="boom",
+                    output=None,
+                    trace_id=None,
+                    observation_id=None,
+                    status_code=500,
+                    latency_ms=50.0,
+                    error="HTTP 500",
+                    response_metadata=None,
+                ),
+            ],
+            warnings=["1 endpoint request failed"],
+            summary={"success_rate": 0.5, "avg_latency_ms": 86.5},
+        )
+
+
+class FakeOpenRewardRunner:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def run_openreward_execution(self, *, items: list[Any], request: Any) -> OpenRewardExecutionOutput:
+        self.calls.append({"items": items, "request": request})
+        return OpenRewardExecutionOutput(
+            processed_items=len(items),
+            failed_items=1,
+            item_results=[
+                OpenRewardItemResult(
+                    dataset_item_id=items[0].id,
+                    session_id="sid-1",
+                    prompt_blocks=[{"type": "text", "text": "Solve the task"}],
+                    available_tools=["submit"],
+                    tool_input={"answer": items[0].expected_output},
+                    tool_output={"blocks": [{"type": "text", "text": "Correct"}], "reward": 1.0, "finished": True},
+                    output="Correct",
+                    reward=1.0,
+                    finished=True,
+                    rollout_id="rollout-1",
+                    rollout_url="https://openreward.ai/rollout/rollout-1",
+                    latency_ms=80.0,
+                    metadata={"judge": "pass"},
+                ),
+                OpenRewardItemResult(
+                    dataset_item_id=items[1].id,
+                    session_id="sid-2",
+                    prompt_blocks=[],
+                    available_tools=["submit"],
+                    tool_input={"answer": items[1].expected_output},
+                    output=None,
+                    reward=None,
+                    finished=None,
+                    rollout_id=None,
+                    rollout_url=None,
+                    latency_ms=40.0,
+                    error="tool missing",
+                ),
+            ],
+            warnings=["1 openreward item failed"],
+            summary={"success_rate": 0.5, "average_reward": 1.0, "finished_rate": 1.0, "avg_latency_ms": 60.0},
         )
 
 
@@ -362,11 +449,15 @@ class ExperimentRunnerServiceTest(unittest.TestCase):
         }
         self.collector = FakeCollector(dataset, prompts=prompts)
         self.gateway = FakeLLMGateway()
+        self.endpoint_runner = FakeEndpointRunner()
+        self.openreward_runner = FakeOpenRewardRunner()
         self.history_store = InMemoryRunHistoryStore()
         self.prompt_resolver = PromptResolverService(self.collector)
         self.service = ExperimentRunnerService(
             self.collector,
             llm_gateway=self.gateway,
+            endpoint_runner=self.endpoint_runner,
+            openreward_runner=self.openreward_runner,
             prompt_resolver=self.prompt_resolver,
             history_store=self.history_store,
         )
@@ -608,8 +699,86 @@ class ExperimentRunnerServiceTest(unittest.TestCase):
             judge_prompt={"is_ready": False},
             task_model=None,
             judge_model=None,
+            endpoint_config=None,
+            enable_endpoint_judging=False,
+            openreward_config=None,
+            enable_openreward_judging=False,
         )
         self.assertTrue(errors)
+
+    def test_validate_run_form_allows_endpoint_without_judge(self) -> None:
+        errors = validate_run_form(
+            dataset=SimpleNamespace(),
+            mode=ExperimentMode.ENDPOINT_RUN,
+            metrics=[],
+            task_prompt={"is_ready": False},
+            judge_prompt={"is_ready": False},
+            task_model=None,
+            judge_model=None,
+            endpoint_config=EndpointConfig(url="https://example.com/run"),
+            enable_endpoint_judging=False,
+            openreward_config=None,
+            enable_openreward_judging=False,
+        )
+        self.assertEqual(errors, [])
+
+    def test_validate_run_form_allows_openreward_without_judge(self) -> None:
+        errors = validate_run_form(
+            dataset=SimpleNamespace(),
+            mode=ExperimentMode.OPENREWARD_RUN,
+            metrics=[],
+            task_prompt={"is_ready": False},
+            judge_prompt={"is_ready": False},
+            task_model=None,
+            judge_model=None,
+            endpoint_config=None,
+            enable_endpoint_judging=False,
+            openreward_config=OpenRewardConfig(environment_name="owner/env", tool_name="submit"),
+            enable_openreward_judging=False,
+        )
+        self.assertEqual(errors, [])
+
+    def test_run_endpoint_evaluation_persists_history_and_metrics(self) -> None:
+        result = self.service.run_endpoint_evaluation(
+            ExperimentExecutionRequest(
+                dataset_name="support-dataset",
+                mode=ExperimentMode.ENDPOINT_RUN,
+                metrics=[EvaluatorMetricSpec(name="helpfulness")],
+                run_name="endpoint-run",
+                endpoint_config=EndpointConfig(url="https://example.com/run", method="POST"),
+                endpoint_response_mapping=EndpointResponseMapping(response_type="json"),
+                enable_endpoint_judging=False,
+            )
+        )
+        self.assertEqual(result.mode, ExperimentMode.ENDPOINT_RUN)
+        self.assertEqual(result.processed_items, 2)
+        self.assertEqual(result.failed_items, 1)
+        self.assertEqual(result.item_results[0].status_code, 200)
+        self.assertEqual(result.item_results[0].request_payload, {"input": {"question": "How do I reset my password?"}})
+        self.assertTrue(any(metric.name == "success_rate" for metric in result.aggregate_metrics))
+        self.assertEqual(self.history_store.records[0].endpoint_url, "https://example.com/run")
+        self.assertEqual(self.history_store.records[0].mode, ExperimentMode.ENDPOINT_RUN)
+
+    def test_run_openreward_evaluation_persists_history_and_metrics(self) -> None:
+        result = self.service.run_openreward_evaluation(
+            ExperimentExecutionRequest(
+                dataset_name="support-dataset",
+                mode=ExperimentMode.OPENREWARD_RUN,
+                metrics=[EvaluatorMetricSpec(name="correctness")],
+                run_name="openreward-run",
+                openreward_config=OpenRewardConfig(environment_name="owner/env", tool_name="submit"),
+                enable_openreward_judging=False,
+            )
+        )
+        self.assertEqual(result.mode, ExperimentMode.OPENREWARD_RUN)
+        self.assertEqual(result.processed_items, 2)
+        self.assertEqual(result.failed_items, 1)
+        self.assertEqual(result.item_results[0].entity_type, "openreward_session")
+        self.assertEqual(result.item_results[0].request_payload, {"answer": "Use the reset link."})
+        self.assertTrue(any(metric.name == "average_reward" for metric in result.aggregate_metrics))
+        self.assertEqual(self.history_store.records[0].openreward_environment_name, "owner/env")
+        self.assertEqual(self.history_store.records[0].openreward_tool_name, "submit")
+        self.assertEqual(self.history_store.records[0].mode, ExperimentMode.OPENREWARD_RUN)
 
 
 if __name__ == "__main__":

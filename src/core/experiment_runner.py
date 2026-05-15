@@ -9,7 +9,9 @@ from typing import Any, Protocol
 from langfuse.batch_evaluation import EvaluatorInputs
 from langfuse.experiment import Evaluation
 
+from src.core.endpoint_runner import EndpointRunnerService
 from src.core.langfuse_client import LangfuseCollectorClient
+from src.core.openreward_runner import OpenRewardRunnerService
 from src.core.prompt_registry import PromptResolverService
 from src.core.run_history import PostgresRunHistoryStore, RunHistoryStore, build_run_record_id
 from src.schemas.experiment_runner import (
@@ -214,11 +216,15 @@ class ExperimentRunnerService:
         self,
         collector: LangfuseCollectorClient,
         llm_gateway: LLMGateway | None = None,
+        endpoint_runner: EndpointRunnerService | None = None,
+        openreward_runner: OpenRewardRunnerService | None = None,
         prompt_resolver: PromptResolverService | None = None,
         history_store: RunHistoryStore | None = None,
     ) -> None:
         self.collector = collector
         self.llm_gateway = llm_gateway or PydanticAIGateway()
+        self.endpoint_runner = endpoint_runner or EndpointRunnerService()
+        self.openreward_runner = openreward_runner or OpenRewardRunnerService()
         self.prompt_resolver = prompt_resolver or PromptResolverService(collector)
         self.history_store = history_store or PostgresRunHistoryStore()
 
@@ -439,6 +445,194 @@ class ExperimentRunnerService:
             )
             return self._persist_result(failed)
 
+    def run_endpoint_evaluation(self, request: ExperimentExecutionRequest) -> ExperimentExecutionResult:
+        run_name = request.run_name or self._default_run_name(request.dataset_name, request.mode)
+        try:
+            dataset = self.fetch_dataset_by_name(request.dataset_name)
+            if not dataset.items:
+                failed = self._build_failed_result(
+                    request,
+                    errors=["Dataset item icermedigi icin endpoint run calistirilamadi."],
+                    run_name=run_name,
+                )
+                return self._persist_result(failed)
+            if request.endpoint_config is None:
+                failed = self._build_failed_result(
+                    request,
+                    errors=["Endpoint config gerekli."],
+                    run_name=run_name,
+                )
+                return self._persist_result(failed)
+
+            warnings: list[str] = []
+            judge_prompt_summary = None
+            judge_model = request.judge_model or os.getenv("EXPERIMENT_JUDGE_MODEL")
+            if request.enable_endpoint_judging:
+                request, prompt_warnings = self._resolve_request_prompts(request, require_task_prompt=False)
+                warnings.extend(prompt_warnings)
+                judge_prompt_summary = request.resolved_judge_prompt
+            else:
+                judge_prompt_summary = ResolvedPrompt(
+                    source=PromptSource.CUSTOM_PROMPT,
+                    target=PromptTarget.JUDGE,
+                    compiled_text="endpoint_only",
+                    prompt_type=PromptType.TEXT,
+                    fingerprint=None,
+                )
+
+            endpoint_result = self.endpoint_runner.run_endpoint_execution(
+                items=dataset.items,
+                request=request.endpoint_request(),
+            )
+            normalized_rows = self._normalize_endpoint_result_rows(
+                dataset=dataset,
+                endpoint_result=endpoint_result,
+                request=request,
+                judge_prompt=judge_prompt_summary,
+                judge_model=judge_model,
+            )
+            aggregate_metrics = self._aggregate_endpoint_metrics(normalized_rows, endpoint_result.summary)
+            result = ExperimentExecutionResult(
+                mode=ExperimentMode.ENDPOINT_RUN,
+                dataset_name=request.dataset_name,
+                run_name=run_name,
+                description=request.description,
+                status=ExperimentRunStatus.FAILED if endpoint_result.failed_items and endpoint_result.failed_items == endpoint_result.processed_items else ExperimentRunStatus.SUCCEEDED,
+                total_items=len(dataset.items),
+                processed_items=endpoint_result.processed_items,
+                failed_items=endpoint_result.failed_items,
+                warnings=warnings + endpoint_result.warnings,
+                errors=endpoint_result.errors,
+                aggregate_metrics=aggregate_metrics,
+                item_results=normalized_rows,
+                raw_summary={
+                    "task_model": None,
+                    "judge_model": judge_model if request.enable_endpoint_judging else None,
+                    "endpoint_url": request.endpoint_config.url,
+                    "endpoint_method": request.endpoint_config.method,
+                    "endpoint_response_type": request.endpoint_response_mapping.response_type if request.endpoint_response_mapping else None,
+                    "endpoint_judging_enabled": request.enable_endpoint_judging,
+                    "success_rate": endpoint_result.summary.get("success_rate"),
+                    "avg_latency_ms": endpoint_result.summary.get("avg_latency_ms"),
+                },
+                task_prompt_summary=ResolvedPrompt(
+                    source=PromptSource.CUSTOM_PROMPT,
+                    target=PromptTarget.TASK,
+                    compiled_text="endpoint_run",
+                    prompt_type=PromptType.TEXT,
+                    fingerprint=None,
+                ),
+                judge_prompt_summary=judge_prompt_summary,
+            )
+            if request.enable_endpoint_judging:
+                result.published_judge_prompt = self._published_prompt_from_summary(
+                    task_prompt=judge_prompt_summary,
+                    target=PromptPublishTarget.JUDGE,
+                )
+            return self._persist_result(result)
+        except Exception as exc:
+            failed = self._build_failed_result(
+                request,
+                errors=[str(exc)],
+                run_name=run_name,
+            )
+            return self._persist_result(failed)
+
+    def run_openreward_evaluation(self, request: ExperimentExecutionRequest) -> ExperimentExecutionResult:
+        run_name = request.run_name or self._default_run_name(request.dataset_name, request.mode)
+        try:
+            dataset = self.fetch_dataset_by_name(request.dataset_name)
+            if not dataset.items:
+                failed = self._build_failed_result(
+                    request,
+                    errors=["Dataset item icermedigi icin OpenReward run calistirilamadi."],
+                    run_name=run_name,
+                )
+                return self._persist_result(failed)
+            if request.openreward_config is None:
+                failed = self._build_failed_result(
+                    request,
+                    errors=["OpenReward config gerekli."],
+                    run_name=run_name,
+                )
+                return self._persist_result(failed)
+
+            warnings: list[str] = []
+            judge_prompt_summary = None
+            judge_model = request.judge_model or os.getenv("EXPERIMENT_JUDGE_MODEL")
+            if request.enable_openreward_judging:
+                request, prompt_warnings = self._resolve_request_prompts(request, require_task_prompt=False)
+                warnings.extend(prompt_warnings)
+                judge_prompt_summary = request.resolved_judge_prompt
+            else:
+                judge_prompt_summary = ResolvedPrompt(
+                    source=PromptSource.CUSTOM_PROMPT,
+                    target=PromptTarget.JUDGE,
+                    compiled_text="openreward_only",
+                    prompt_type=PromptType.TEXT,
+                    fingerprint=None,
+                )
+
+            openreward_result = self.openreward_runner.run_openreward_execution(
+                items=dataset.items,
+                request=request.openreward_request(),
+            )
+            normalized_rows = self._normalize_openreward_result_rows(
+                dataset=dataset,
+                openreward_result=openreward_result,
+                request=request,
+                judge_prompt=judge_prompt_summary,
+                judge_model=judge_model,
+            )
+            aggregate_metrics = self._aggregate_openreward_metrics(normalized_rows, openreward_result.summary)
+            result = ExperimentExecutionResult(
+                mode=ExperimentMode.OPENREWARD_RUN,
+                dataset_name=request.dataset_name,
+                run_name=run_name,
+                description=request.description,
+                status=ExperimentRunStatus.FAILED if openreward_result.failed_items and openreward_result.failed_items == openreward_result.processed_items else ExperimentRunStatus.SUCCEEDED,
+                total_items=len(dataset.items),
+                processed_items=openreward_result.processed_items,
+                failed_items=openreward_result.failed_items,
+                warnings=warnings + openreward_result.warnings,
+                errors=openreward_result.errors,
+                aggregate_metrics=aggregate_metrics,
+                item_results=normalized_rows,
+                raw_summary={
+                    "task_model": None,
+                    "judge_model": judge_model if request.enable_openreward_judging else None,
+                    "openreward_environment_name": request.openreward_config.environment_name,
+                    "openreward_variant": request.openreward_config.variant,
+                    "openreward_tool_name": request.openreward_config.tool_name,
+                    "openreward_rollout_logging_enabled": request.openreward_config.log_rollout,
+                    "success_rate": openreward_result.summary.get("success_rate"),
+                    "average_reward": openreward_result.summary.get("average_reward"),
+                    "finished_rate": openreward_result.summary.get("finished_rate"),
+                    "avg_latency_ms": openreward_result.summary.get("avg_latency_ms"),
+                },
+                task_prompt_summary=ResolvedPrompt(
+                    source=PromptSource.CUSTOM_PROMPT,
+                    target=PromptTarget.TASK,
+                    compiled_text="openreward_run",
+                    prompt_type=PromptType.TEXT,
+                    fingerprint=None,
+                ),
+                judge_prompt_summary=judge_prompt_summary,
+            )
+            if request.enable_openreward_judging:
+                result.published_judge_prompt = self._published_prompt_from_summary(
+                    task_prompt=judge_prompt_summary,
+                    target=PromptPublishTarget.JUDGE,
+                )
+            return self._persist_result(result)
+        except Exception as exc:
+            failed = self._build_failed_result(
+                request,
+                errors=[str(exc)],
+                run_name=run_name,
+            )
+            return self._persist_result(failed)
+
     @staticmethod
     def _build_batch_filter(target_ids: list[str]) -> str | None:
         if not target_ids:
@@ -566,6 +760,14 @@ class ExperimentRunnerService:
             else None,
             task_model=result.raw_summary.get("task_model"),
             judge_model=result.raw_summary.get("judge_model"),
+            endpoint_url=result.raw_summary.get("endpoint_url"),
+            endpoint_method=result.raw_summary.get("endpoint_method"),
+            endpoint_response_type=result.raw_summary.get("endpoint_response_type"),
+            endpoint_judging_enabled=bool(result.raw_summary.get("endpoint_judging_enabled")),
+            openreward_environment_name=result.raw_summary.get("openreward_environment_name"),
+            openreward_variant=result.raw_summary.get("openreward_variant"),
+            openreward_tool_name=result.raw_summary.get("openreward_tool_name"),
+            openreward_rollout_logging_enabled=bool(result.raw_summary.get("openreward_rollout_logging_enabled")),
             metric_names=[metric.name for metric in result.aggregate_metrics] or list({evaluation.name for item in result.item_results for evaluation in item.evaluations}),
             aggregate_metrics=result.aggregate_metrics,
             processed_items=result.processed_items,
@@ -659,6 +861,16 @@ class ExperimentRunnerService:
             raw_summary={
                 "task_model": request.task_model or os.getenv("EXPERIMENT_TASK_MODEL"),
                 "judge_model": request.judge_model or os.getenv("EXPERIMENT_JUDGE_MODEL"),
+                "endpoint_url": request.endpoint_config.url if request.endpoint_config else None,
+                "endpoint_method": request.endpoint_config.method if request.endpoint_config else None,
+                "endpoint_response_type": (
+                    request.endpoint_response_mapping.response_type if request.endpoint_response_mapping else None
+                ),
+                "endpoint_judging_enabled": request.enable_endpoint_judging,
+                "openreward_environment_name": request.openreward_config.environment_name if request.openreward_config else None,
+                "openreward_variant": request.openreward_config.variant if request.openreward_config else None,
+                "openreward_tool_name": request.openreward_config.tool_name if request.openreward_config else None,
+                "openreward_rollout_logging_enabled": request.openreward_config.log_rollout if request.openreward_config else False,
             },
             task_prompt_summary=task_prompt_summary,
             judge_prompt_summary=judge_prompt_summary,
@@ -824,6 +1036,212 @@ class ExperimentRunnerService:
             evaluations=evaluations,
         )
 
+    def _normalize_endpoint_result_rows(
+        self,
+        *,
+        dataset: DatasetFetchResult,
+        endpoint_result: Any,
+        request: ExperimentExecutionRequest,
+        judge_prompt: ResolvedPrompt,
+        judge_model: str | None,
+    ) -> list[ExperimentItemResultView]:
+        dataset_map = {item.id: item for item in dataset.items}
+        rows: list[ExperimentItemResultView] = []
+        for item_result in endpoint_result.item_results:
+            dataset_item = dataset_map.get(item_result.dataset_item_id or "")
+            row = ExperimentItemResultView(
+                dataset_item_id=item_result.dataset_item_id,
+                entity_id=item_result.dataset_item_id,
+                entity_type="endpoint_item",
+                trace_id=item_result.trace_id or (dataset_item.source_trace_id if dataset_item else None),
+                input=dataset_item.input if dataset_item else None,
+                expected_output=dataset_item.expected_output if dataset_item else None,
+                output=item_result.output,
+                request_payload=item_result.request_payload,
+                raw_response=item_result.raw_response,
+                observation_id=item_result.observation_id or (dataset_item.source_observation_id if dataset_item else None),
+                status_code=item_result.status_code,
+                latency_ms=item_result.latency_ms,
+                error=item_result.error,
+                response_metadata=item_result.response_metadata,
+                evaluations=[],
+            )
+            if request.enable_endpoint_judging and judge_model and item_result.error is None:
+                row.evaluations = asyncio.run(
+                    self._evaluate_output_row(
+                        request=request,
+                        row=row,
+                        judge_prompt=judge_prompt,
+                        judge_model=judge_model,
+                    )
+                )
+            rows.append(row)
+        return rows
+
+    def _normalize_openreward_result_rows(
+        self,
+        *,
+        dataset: DatasetFetchResult,
+        openreward_result: Any,
+        request: ExperimentExecutionRequest,
+        judge_prompt: ResolvedPrompt,
+        judge_model: str | None,
+    ) -> list[ExperimentItemResultView]:
+        dataset_map = {item.id: item for item in dataset.items}
+        rows: list[ExperimentItemResultView] = []
+        for item_result in openreward_result.item_results:
+            dataset_item = dataset_map.get(item_result.dataset_item_id or "")
+            row = ExperimentItemResultView(
+                dataset_item_id=item_result.dataset_item_id,
+                entity_id=item_result.session_id or item_result.dataset_item_id,
+                entity_type="openreward_session",
+                trace_id=dataset_item.source_trace_id if dataset_item else None,
+                input=dataset_item.input if dataset_item else None,
+                expected_output=dataset_item.expected_output if dataset_item else None,
+                output=item_result.output,
+                request_payload=item_result.tool_input,
+                raw_response=item_result.tool_output,
+                observation_id=dataset_item.source_observation_id if dataset_item else None,
+                latency_ms=item_result.latency_ms,
+                error=item_result.error,
+                response_metadata={
+                    "reward": item_result.reward,
+                    "finished": item_result.finished,
+                    "prompt_blocks": item_result.prompt_blocks,
+                    "available_tools": item_result.available_tools,
+                    "rollout_id": item_result.rollout_id,
+                    "rollout_url": item_result.rollout_url,
+                    "metadata": item_result.metadata,
+                },
+                evaluations=[],
+            )
+            if request.enable_openreward_judging and judge_model and item_result.error is None:
+                row.evaluations = asyncio.run(
+                    self._evaluate_output_row(
+                        request=request,
+                        row=row,
+                        judge_prompt=judge_prompt,
+                        judge_model=judge_model,
+                    )
+                )
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _aggregate_endpoint_metrics(
+        rows: list[ExperimentItemResultView],
+        summary: dict[str, Any],
+    ) -> list[AggregateMetricResult]:
+        metrics = ExperimentRunnerService._aggregate_metrics_from_rows(rows)
+        success_rate = summary.get("success_rate")
+        if isinstance(success_rate, (int, float)):
+            metrics.append(
+                AggregateMetricResult(
+                    name="success_rate",
+                    average_score=float(success_rate),
+                    count=len(rows),
+                )
+            )
+        avg_latency = summary.get("avg_latency_ms")
+        latency_rows = [row for row in rows if row.latency_ms is not None]
+        if isinstance(avg_latency, (int, float)):
+            metrics.append(
+                AggregateMetricResult(
+                    name="avg_latency_ms",
+                    average_score=float(avg_latency),
+                    count=len(latency_rows),
+                )
+            )
+        metrics.sort(key=lambda metric: metric.name)
+        return metrics
+
+    @staticmethod
+    def _aggregate_openreward_metrics(
+        rows: list[ExperimentItemResultView],
+        summary: dict[str, Any],
+    ) -> list[AggregateMetricResult]:
+        metrics = ExperimentRunnerService._aggregate_metrics_from_rows(rows)
+        success_rate = summary.get("success_rate")
+        if isinstance(success_rate, (int, float)):
+            metrics.append(
+                AggregateMetricResult(
+                    name="success_rate",
+                    average_score=float(success_rate),
+                    count=len(rows),
+                )
+            )
+        average_reward = summary.get("average_reward")
+        rewarded_rows = [
+            row for row in rows if isinstance((row.response_metadata or {}).get("reward"), (int, float))
+        ]
+        if isinstance(average_reward, (int, float)):
+            metrics.append(
+                AggregateMetricResult(
+                    name="average_reward",
+                    average_score=float(average_reward),
+                    count=len(rewarded_rows),
+                )
+            )
+        finished_rate = summary.get("finished_rate")
+        finished_rows = [row for row in rows if (row.response_metadata or {}).get("finished") is not None]
+        if isinstance(finished_rate, (int, float)):
+            metrics.append(
+                AggregateMetricResult(
+                    name="finished_rate",
+                    average_score=float(finished_rate),
+                    count=len(finished_rows),
+                )
+            )
+        avg_latency = summary.get("avg_latency_ms")
+        latency_rows = [row for row in rows if row.latency_ms is not None]
+        if isinstance(avg_latency, (int, float)):
+            metrics.append(
+                AggregateMetricResult(
+                    name="avg_latency_ms",
+                    average_score=float(avg_latency),
+                    count=len(latency_rows),
+                )
+            )
+        metrics.sort(key=lambda metric: metric.name)
+        return metrics
+
+    async def _evaluate_output_row(
+        self,
+        *,
+        request: ExperimentExecutionRequest,
+        row: ExperimentItemResultView,
+        judge_prompt: ResolvedPrompt,
+        judge_model: str,
+    ) -> list[NormalizedEvaluationResult]:
+        evaluations: list[NormalizedEvaluationResult] = []
+        for metric in request.metrics:
+            judged = await self.llm_gateway.aevaluate_metric(
+                model_name=judge_model,
+                judge_prompt=judge_prompt.compiled_text,
+                metric=metric,
+                item_input=row.input,
+                output=row.output,
+                expected_output=row.expected_output,
+                metadata=row.response_metadata,
+            )
+            evaluations.append(
+                NormalizedEvaluationResult(
+                    name=metric.name,
+                    value=judged.score,
+                    comment=judged.comment,
+                    metadata={
+                        "rubric": metric.rubric,
+                        "is_custom": metric.is_custom,
+                        "judge_prompt_name": judge_prompt.prompt_name,
+                        "judge_prompt_label": judge_prompt.prompt_label,
+                        "judge_prompt_version": judge_prompt.prompt_version,
+                        "judge_prompt_fingerprint": judge_prompt.fingerprint,
+                        "judge_prompt_source": judge_prompt.source.value,
+                    },
+                )
+            )
+        return evaluations
+
     @staticmethod
     def _normalize_evaluation(evaluation: Any) -> NormalizedEvaluationResult:
         metadata = getattr(evaluation, "metadata", None)
@@ -973,6 +1391,14 @@ def run_dataset_reevaluation(request: ExperimentExecutionRequest) -> ExperimentE
 
 def run_llm_judge_on_existing_results(request: ExperimentExecutionRequest) -> ExperimentExecutionResult:
     return _get_service().run_dataset_reevaluation(request)
+
+
+def run_endpoint_evaluation(request: ExperimentExecutionRequest) -> ExperimentExecutionResult:
+    return _get_service().run_endpoint_evaluation(request)
+
+
+def run_openreward_evaluation(request: ExperimentExecutionRequest) -> ExperimentExecutionResult:
+    return _get_service().run_openreward_evaluation(request)
 
 
 

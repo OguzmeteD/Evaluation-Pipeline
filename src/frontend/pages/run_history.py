@@ -30,7 +30,13 @@ def render() -> None:
     dataset_name = st.text_input("Dataset filter", key="history_dataset_name")
     mode_value = st.selectbox(
         "Mode filter",
-        options=["all", ExperimentMode.PROMPT_RUNNER.value, ExperimentMode.REEVALUATE_EXISTING.value],
+        options=[
+            "all",
+            ExperimentMode.PROMPT_RUNNER.value,
+            ExperimentMode.REEVALUATE_EXISTING.value,
+            ExperimentMode.ENDPOINT_RUN.value,
+            ExperimentMode.OPENREWARD_RUN.value,
+        ],
         key="history_mode",
     )
     selected_statuses = st.multiselect(
@@ -98,6 +104,14 @@ def _render_history(
                 "judge_prompt_type": record.judge_prompt_type.value if record.judge_prompt_type else None,
                 "published_from_custom": record.published_from_custom,
                 "published_at": str(record.published_at) if record.published_at else None,
+                "endpoint_url": record.endpoint_url,
+                "endpoint_method": record.endpoint_method,
+                "endpoint_response_type": record.endpoint_response_type,
+                "endpoint_judging_enabled": record.endpoint_judging_enabled,
+                "openreward_environment_name": record.openreward_environment_name,
+                "openreward_variant": record.openreward_variant,
+                "openreward_tool_name": record.openreward_tool_name,
+                "openreward_rollout_logging_enabled": record.openreward_rollout_logging_enabled,
             }
         )
         if record.warnings:

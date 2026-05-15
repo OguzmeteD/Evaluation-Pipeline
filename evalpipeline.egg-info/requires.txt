@@ -1,3 +1,0 @@
-pydantic<3,>=2.12
-langfuse<4,>=3
-streamlit<2,>=1.32

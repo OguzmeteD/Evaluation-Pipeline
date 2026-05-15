@@ -518,6 +518,385 @@ publish_result = publish_prompt(
   - `python3 -m unittest tests.test_experiment_runner tests.test_experiment_studio_page tests.test_run_history_page -v`
   - `python3 -m unittest discover -s tests -v`
 - Mevcut durum:
+
+## 2026-04-02 Generic Endpoint Runner + OpenReward Hazirlik Katmani
+
+Bu iterasyonda `Experiment Studio` icine yeni bir `Endpoint Run` execution modu eklendi. Sistem artik ayni Langfuse dataset kaynagini kullanarak:
+
+- `Prompt Runner`
+- `Re-evaluate Existing`
+- `Endpoint Run`
+
+akislari arasinda gecis yapabiliyor.
+
+Bu degisiklikte OpenReward'in kendisi henuz calistirilmadi; ancak execution contract'i endpoint tabanli bir katmanla ortaklasacak sekilde hazirlandi. Yani ikinci fazda `OpenReward Run` benzer bir request/result sozlesmesiyle ayni arayuze eklenebilecek.
+
+### Bu iterasyonda ne degisti
+
+- `src/schemas/endpoint_runner.py`
+  - Yeni modul.
+  - Generic HTTP endpoint execution icin tipli modeller eklendi:
+    - `EndpointConfig`
+    - `EndpointPayloadMapping`
+    - `EndpointResponseMapping`
+    - `EndpointExecutionRequest`
+    - `EndpointExecutionResult`
+    - `EndpointItemResult`
+- `src/core/endpoint_runner.py`
+  - Yeni modul.
+  - Langfuse dataset item'larini generic HTTP endpoint'e gonderen servis eklendi.
+  - Desteklenen davranislar:
+    - `GET` ve `POST`
+    - JSON body gonderimi
+    - `text` veya `json` response parse etme
+    - request timeout
+    - network ve `5xx` retry
+    - `4xx` hata durumunda item-level failure
+  - Request template icinde placeholder injection destekleniyor:
+    - `{{input}}`
+    - `{{expected_output}}`
+    - `{{metadata}}`
+    - `{{dataset_item_id}}`
+    - `{{source_trace_id}}`
+    - `{{source_observation_id}}`
+- `src/schemas/experiment_runner.py`
+  - `ExperimentMode.ENDPOINT_RUN` eklendi.
+  - `ExperimentExecutionRequest` endpoint config alanlariyla genisletildi:
+    - `endpoint_config`
+    - `endpoint_payload_mapping`
+    - `endpoint_response_mapping`
+    - `enable_endpoint_judging`
+  - `ExperimentItemResultView` endpoint sonuc detaylarini tasiyacak sekilde genisletildi:
+    - `request_payload`
+    - `raw_response`
+    - `observation_id`
+    - `status_code`
+    - `latency_ms`
+    - `error`
+    - `response_metadata`
+  - `ExperimentRunRecord` endpoint history alanlariyla genisletildi:
+    - `endpoint_url`
+    - `endpoint_method`
+    - `endpoint_response_type`
+    - `endpoint_judging_enabled`
+- `src/core/experiment_runner.py`
+  - Yeni public giris eklendi: `run_endpoint_evaluation(...)`
+  - Endpoint run akisi:
+    1. Langfuse dataset fetch edilir
+    2. Her item endpoint payload'ina map edilir
+    3. HTTP endpoint cagrilir
+    4. Response normalize edilir
+    5. `enable_endpoint_judging=True` ise mevcut judge metric akisi endpoint output uzerinde tekrar kullanilir
+    6. `success_rate` ve `avg_latency_ms` aggregate metric olarak uretilir
+    7. Sonuc mevcut `experiment_runs` history tablosuna yazilir
+  - Endpoint item sonuclari `ExperimentItemResultView` formatina normalize edilir.
+- `src/core/run_history.py`
+  - `experiment_runs` tablosu additive olarak genisletildi:
+    - `endpoint_url`
+    - `endpoint_method`
+    - `endpoint_response_type`
+    - `endpoint_judging_enabled`
+  - Ayrica save/list akislari bu alanlari okuyup yazacak sekilde guncellendi.
+- `src/frontend/pages/experiment_studio.py`
+  - Yeni execution mode secenegi eklendi: `Endpoint Run`
+  - Mode secilince yeni UI bloklari aciliyor:
+    - `Endpoint Config`
+    - `Request Mapping`
+    - `Response Mapping`
+    - `Auth`
+  - Endpoint mode'da:
+    - task prompt alani pasiflestirildi
+    - judge prompt sadece endpoint judging aciksa zorunlu
+    - `judge prompt` yoksa endpoint-only run calisabiliyor
+  - Sonuc detay paneli endpoint item satirlari icin artik sunlari gosteriyor:
+    - request payload
+    - raw response
+    - response metadata
+    - status code
+    - latency
+    - endpoint error
+- `src/frontend/pages/run_history.py`
+  - Mode filtrelerine `endpoint_run` eklendi.
+  - Run detay paneli endpoint history alanlarini da gosteriyor.
+- `tests/test_endpoint_runner.py`
+  - Yeni test dosyasi.
+  - Asagidaki kritik davranislar kilitlendi:
+    - placeholder injection
+    - JSON response path extraction
+    - text response normalize etme
+    - `4xx` hata durumunda retry etmeden item-level failure
+    - network error sonrasi retry ile basarili tamamlama
+- `tests/test_experiment_runner.py`
+  - Endpoint mode validasyonu ve history persistence testleri eklendi.
+
+### Sistem nasil calisir
+
+`Endpoint Run` modu, mevcut Langfuse dataset item'larini generic bir HTTP endpoint'e yollayan execution katmanidir.
+
+Varsayilan veri akisi:
+
+1. Kullanici `Experiment Studio` icinde dataset secer.
+2. `Endpoint Run` modu secilir.
+3. Endpoint URL, method, response type ve auth alani doldurulur.
+4. Her dataset item icin varsayilan request body su sekilde uretilir:
+
+```json
+{
+  "input": "<dataset_item.input>"
+}
+```
+
+5. Eger `request_template` verilirse sistem placeholder'lari item verileri ile doldurur.
+6. Endpoint'ten donen response:
+   - `text` ise dogrudan output kabul edilir
+   - `json` ise istenen `json path` alanlarindan output / trace id / observation id / metadata cikarilir
+7. `Enable endpoint judging` aciksa ayni output mevcut judge prompt + metric akisiyla puanlanir.
+8. Sonuclar history ve UI detay gorunumune yazilir.
+
+### Kisa kod ornekleri
+
+#### Endpoint run cagirimi
+
+```python
+from src.core.experiment_runner import run_endpoint_evaluation
+from src.schemas.endpoint_runner import EndpointConfig, EndpointPayloadMapping, EndpointResponseMapping
+from src.schemas.experiment_runner import EvaluatorMetricSpec, ExperimentExecutionRequest, ExperimentMode
+
+result = run_endpoint_evaluation(
+    ExperimentExecutionRequest(
+        dataset_name="support-dataset",
+        mode=ExperimentMode.ENDPOINT_RUN,
+        judge_model="openai:gpt-4.1",
+        enable_endpoint_judging=True,
+        metrics=[EvaluatorMetricSpec(name="correctness")],
+        judge_prompt="Cevabi dogruluk acisindan 0.0-1.0 araliginda puanla.",
+        endpoint_config=EndpointConfig(
+            url="https://example.com/chat",
+            method="POST",
+            timeout_seconds=20,
+            retry_count=1,
+        ),
+        endpoint_payload_mapping=EndpointPayloadMapping(
+            request_template={
+                "message": "{{input}}",
+                "reference": "{{expected_output}}",
+            }
+        ),
+        endpoint_response_mapping=EndpointResponseMapping(
+            response_type="json",
+            output_json_path="answer",
+            trace_id_json_path="trace.id",
+        ),
+    )
+)
+
+print(result.status)
+print(result.aggregate_metrics)
+```
+
+#### Endpoint-only cagirimi
+
+```python
+from src.core.experiment_runner import run_endpoint_evaluation
+from src.schemas.endpoint_runner import EndpointConfig
+from src.schemas.experiment_runner import ExperimentExecutionRequest, ExperimentMode
+
+result = run_endpoint_evaluation(
+    ExperimentExecutionRequest(
+        dataset_name="support-dataset",
+        mode=ExperimentMode.ENDPOINT_RUN,
+        enable_endpoint_judging=False,
+        endpoint_config=EndpointConfig(url="https://example.com/chat"),
+    )
+)
+```
+
+### Mevcut durum
+
+- `Endpoint Run` execution mode calisiyor.
+- Endpoint run sonuclari mevcut `Experiment Studio` sonuc gorunumunde incelenebiliyor.
+- Endpoint run history kayitlari mevcut `experiment_runs` tablosuna yaziliyor.
+- `success_rate` ve `avg_latency_ms` aggregate metric olarak uretiliyor.
+- Endpoint response'tan `trace_id` ve `observation_id` JSON path ile cekilebiliyor.
+- OpenReward execution katmani henuz eklenmedi, ancak endpoint-first tasarim ayni dataset/result contract'i uzerinden buna hazirlandi.
+- Dogrulama:
+  - `python3 -m unittest tests.test_endpoint_runner tests.test_experiment_runner tests.test_experiment_studio_page tests.test_run_history_page -v`
+  - `python3 -m unittest discover -s tests -v`
+
+### Sonraki onerilen adimlar
+
+1. `OpenReward Run` icin ayri client ve runner ekleyin; ayni dataset kaynagi ve result contract'ini reuse edin.
+2. Endpoint runner icin `streaming/SSE` destegi gerekiyorsa ikinci fazda ekleyin.
+3. Auth tarafina `custom header name` ve birden fazla API key header destegi ekleyin.
+4. Endpoint response JSON path validasyonunu UI tarafinda preflight preview ile guclendirin.
+
+## 2026-04-02 OpenReward Run Katmani
+
+Bu iterasyonda `Experiment Studio` icine `OpenReward Run` execution modu eklendi. Tasarim mevcut Langfuse dataset merkezli mimariyi koruyor; fark sadece execution backend'in OpenReward ORS session API olmasi.
+
+Ilk surum kapsamli ama bilincli olarak sinirli:
+
+- dataset item -> ORS `task_spec`
+- secilen tek bir tool -> templated input ile cagrilir
+- `reward`, `finished`, prompt bloklari ve rollout bilgisi toplanir
+- istenirse mevcut judge metric akisi OpenReward output uzerinde tekrar calistirilir
+
+Bu surum tam bir generic agent loop yazmiyor. Yani cok adimli tool-planning yapan ajan yerine, environment icindeki belirli bir tool'u kontrollu ve templated bir sekilde cagiriyor. Bu karar ilk surum icin daha dogru; cunku gercek ORS/OpenReward client sozlesmesine dayaniyor ve sonradan cok adimli agent loop'a genisleyebiliyor.
+
+### Eklenen veya degistirilen moduller
+
+- `pyproject.toml`
+  - `openreward>=0.1.89,<0.2` bagimliligi eklendi.
+- `src/schemas/openreward_runner.py`
+  - Yeni modul.
+  - OpenReward execution sozlesmeleri tanimlandi:
+    - `OpenRewardConfig`
+    - `OpenRewardExecutionRequest`
+    - `OpenRewardExecutionResult`
+    - `OpenRewardItemResult`
+- `src/core/openreward_runner.py`
+  - Yeni modul.
+  - OpenReward / ORS session API ile calisan runner eklendi.
+  - Desteklenen davranislar:
+    - environment getirme
+    - dataset item -> `task_spec` mapping
+    - tool input template placeholder injection
+    - `session.get_prompt()`
+    - `session.list_tools()`
+    - `session.call_tool(...)`
+    - opsiyonel `rollout.create(...)` + rollout loglama
+  - Test ortami ve sistem Python uyumu icin lazy import / fallback dataclass mekanizmasi kullanildi; boylece `openreward` paketi yalnizca gercek runtime'da gereklidir.
+- `src/schemas/experiment_runner.py`
+  - Yeni mode eklendi:
+    - `ExperimentMode.OPENREWARD_RUN`
+  - `ExperimentExecutionRequest` alanlari genisletildi:
+    - `openreward_config`
+    - `enable_openreward_judging`
+  - `ExperimentRunRecord` history alanlari genisletildi:
+    - `openreward_environment_name`
+    - `openreward_variant`
+    - `openreward_tool_name`
+    - `openreward_rollout_logging_enabled`
+- `src/core/experiment_runner.py`
+  - Yeni public giris:
+    - `run_openreward_evaluation(...)`
+  - Yeni akis:
+    1. Langfuse dataset fetch
+    2. OpenReward environment session execution
+    3. reward/finished/rollout normalize etme
+    4. opsiyonel judge metric calistirma
+    5. aggregate metrics uretme
+    6. mevcut `experiment_runs` history tablosuna kaydetme
+  - Yeni aggregate metrikler:
+    - `success_rate`
+    - `average_reward`
+    - `finished_rate`
+    - `avg_latency_ms`
+- `src/core/run_history.py`
+  - `experiment_runs` tablosu additive olarak genisletildi:
+    - `openreward_environment_name`
+    - `openreward_variant`
+    - `openreward_tool_name`
+    - `openreward_rollout_logging_enabled`
+- `src/frontend/pages/experiment_studio.py`
+  - Yeni execution mode:
+    - `OpenReward Run`
+  - Yeni UI bloklari:
+    - `OpenReward Config`
+    - environment name
+    - variant
+    - tool name
+    - task spec template JSON
+    - tool input template JSON
+    - rollout logging ayarlari
+  - `Enable OpenReward judging` toggle eklendi.
+  - OpenReward mode'da judge prompt yalnizca judging aciksa zorunlu.
+- `src/frontend/pages/run_history.py`
+  - Mode filter'a `openreward_run` eklendi.
+  - Detay panelinde OpenReward alanlari da gosteriliyor.
+- `tests/test_openreward_runner.py`
+  - Yeni test dosyasi.
+  - Dogrulanan davranislar:
+    - expected_output placeholder injection
+    - rollout logging ile URL uretilmesi
+- `tests/test_experiment_runner.py`
+  - OpenReward mode validasyonu ve history persistence testleri eklendi.
+
+### Sistem nasil calisir
+
+`OpenReward Run` akisinda her Langfuse dataset item'i bir ORS `task_spec`'e donusturulur.
+
+Varsayilan mapping:
+
+- item `input` dict ise direkt `task_spec`
+- degilse:
+
+```python
+{
+    "input": item.input,
+    "expected_output": item.expected_output,
+    "metadata": item.metadata or {},
+    "dataset_item_id": item.id,
+}
+```
+
+Tool input tarafinda varsayilan davranis:
+
+- `tool_input_template` varsa placeholder'lar cozulur
+- yoksa:
+
+```python
+{tool_input_field_name: item.expected_output if item.expected_output is not None else item.input}
+```
+
+Bu sayede benchmark veya tek-adimli `submit` benzeri environment'larda dataset referans cevabi ile kontrollu bir ORS cagrisi yapilabilir.
+
+### Kisa kod ornegi
+
+```python
+from src.core.experiment_runner import run_openreward_evaluation
+from src.schemas.experiment_runner import ExperimentExecutionRequest, ExperimentMode
+from src.schemas.openreward_runner import OpenRewardConfig
+
+result = run_openreward_evaluation(
+    ExperimentExecutionRequest(
+        dataset_name="support-dataset",
+        mode=ExperimentMode.OPENREWARD_RUN,
+        openreward_config=OpenRewardConfig(
+            environment_name="owner/env-name",
+            tool_name="submit",
+            tool_input_template={"answer": "{{expected_output}}"},
+            log_rollout=True,
+        ),
+        enable_openreward_judging=False,
+        metrics=[],
+    )
+)
+
+print(result.aggregate_metrics)
+```
+
+### Mevcut durum
+
+- `Experiment Studio` artik dort execution mode destekliyor:
+  - `Prompt Runner`
+  - `Re-evaluate Existing`
+  - `Endpoint Run`
+  - `OpenReward Run`
+- OpenReward mode gercek ORS/OpenReward session modeliyle uyumlu tasarlandi.
+- Optional rollout logging destekleniyor.
+- History mevcut `experiment_runs` tablosunda tutuluyor; ayri tablo acilmadi.
+- OpenReward output'u uzerinde mevcut judge metric akisi opsiyonel olarak tekrar kullanilabiliyor.
+- Dogrulama:
+  - `python3 -m unittest tests.test_openreward_runner tests.test_experiment_runner tests.test_run_history_page -v`
+  - `python3 -m unittest discover -s tests -v`
+
+### Sonraki onerilen adimlar
+
+1. OpenReward mode icin tek tool yerine cok-adimli generic agent loop ekleyin.
+2. Environment browser / public environment discovery UI ekleyin.
+3. ORS tool input template'lerinde nested JSON path placeholder destegi ekleyin.
+4. OpenReward rollout linklerini ayri bir detay panelinde daha zengin gosterin.
   - publish + reuse backend olarak aktif
   - UI akisi aktif
   - run history publish metadata tutuyor

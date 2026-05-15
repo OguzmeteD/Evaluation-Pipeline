@@ -6,6 +6,14 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from src.schemas.endpoint_runner import (
+    EndpointConfig,
+    EndpointExecutionRequest as EndpointExecutionPayload,
+    EndpointPayloadMapping,
+    EndpointResponseMapping,
+)
+from src.schemas.openreward_runner import OpenRewardConfig, OpenRewardExecutionRequest as OpenRewardExecutionPayload
+
 
 PRESET_METRIC_RUBRICS: dict[str, str] = {
     "helpfulness": "Score how well the answer helps the user solve the stated task.",
@@ -19,6 +27,8 @@ PRESET_METRIC_RUBRICS: dict[str, str] = {
 class ExperimentMode(str, Enum):
     PROMPT_RUNNER = "prompt_runner"
     REEVALUATE_EXISTING = "reevaluate_existing"
+    ENDPOINT_RUN = "endpoint_run"
+    OPENREWARD_RUN = "openreward_run"
 
 
 class EvaluationScope(str, Enum):
@@ -182,6 +192,32 @@ class ExperimentExecutionRequest(BaseModel):
     use_published_judge_prompt: bool = False
     resolved_task_prompt: ResolvedPrompt | None = None
     resolved_judge_prompt: ResolvedPrompt | None = None
+    endpoint_config: EndpointConfig | None = None
+    endpoint_payload_mapping: EndpointPayloadMapping | None = None
+    endpoint_response_mapping: EndpointResponseMapping | None = None
+    enable_endpoint_judging: bool = False
+    openreward_config: OpenRewardConfig | None = None
+    enable_openreward_judging: bool = False
+
+    def endpoint_request(self) -> EndpointExecutionPayload:
+        if self.endpoint_config is None:
+            raise ValueError("Endpoint config gerekli.")
+        return EndpointExecutionPayload(
+            endpoint_config=self.endpoint_config,
+            payload_mapping=self.endpoint_payload_mapping or EndpointPayloadMapping(),
+            response_mapping=self.endpoint_response_mapping or EndpointResponseMapping(),
+            enable_judging=self.enable_endpoint_judging,
+        )
+
+    def openreward_request(self) -> OpenRewardExecutionPayload:
+        if self.openreward_config is None:
+            raise ValueError("OpenReward config gerekli.")
+        return OpenRewardExecutionPayload(
+            config=self.openreward_config,
+            run_name=self.run_name or "",
+            dataset_name=self.dataset_name,
+            enable_judging=self.enable_openreward_judging,
+        )
 
 
 class NormalizedEvaluationResult(BaseModel):
@@ -200,6 +236,13 @@ class ExperimentItemResultView(BaseModel):
     input: Any = None
     expected_output: Any = None
     output: Any = None
+    request_payload: Any = None
+    raw_response: Any = None
+    observation_id: str | None = None
+    status_code: int | None = None
+    latency_ms: float | None = None
+    error: str | None = None
+    response_metadata: dict[str, Any] | None = None
     evaluations: list[NormalizedEvaluationResult] = Field(default_factory=list)
 
 
@@ -233,6 +276,14 @@ class ExperimentRunRecord(BaseModel):
     published_at: datetime | None = None
     task_model: str | None = None
     judge_model: str | None = None
+    endpoint_url: str | None = None
+    endpoint_method: str | None = None
+    endpoint_response_type: str | None = None
+    endpoint_judging_enabled: bool = False
+    openreward_environment_name: str | None = None
+    openreward_variant: str | None = None
+    openreward_tool_name: str | None = None
+    openreward_rollout_logging_enabled: bool = False
     metric_names: list[str] = Field(default_factory=list)
     aggregate_metrics: list[AggregateMetricResult] = Field(default_factory=list)
     processed_items: int = 0
